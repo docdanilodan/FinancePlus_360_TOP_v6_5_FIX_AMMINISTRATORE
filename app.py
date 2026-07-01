@@ -16,7 +16,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 
-APP_VERSION="TOP v6.6 MITTENTI AUTORIZZATI"
+APP_VERSION="TOP v6.7 IMAP SAFE - MITTENTI AUTORIZZATI"
 
 # Filtro rigido mittenti autorizzati per il modulo Scarica Mail.
 # Il download IMAP salva esclusivamente email e allegati provenienti da questi indirizzi.
@@ -303,6 +303,17 @@ def enhanced_schema():
     try:
         if not table_has_column("documenti","hash_md5"):
             x("ALTER TABLE documenti ADD COLUMN hash_md5 TEXT")
+    except Exception:
+        pass
+    # Colonne mail v6.7: evita di riscaricare messaggi già archiviati e riduce FETCH IMAP
+    try:
+        if not table_has_column("mail_messages","message_id"):
+            x("ALTER TABLE mail_messages ADD COLUMN message_id TEXT")
+    except Exception:
+        pass
+    try:
+        if not table_has_column("mail_messages","imap_num"):
+            x("ALTER TABLE mail_messages ADD COLUMN imap_num TEXT")
     except Exception:
         pass
 
@@ -843,27 +854,29 @@ def detect_azienda(text):
     return ""
 
 def company_candidate_from_mail(mittente_mail, oggetto, body, allegati=None):
+    """Restituisce un cliente solo se il riconoscimento è sufficientemente affidabile.
+    Se non trova una ragione sociale / P.IVA / CF, ritorna stringa vuota: il documento va in temporanea.
+    """
     full = f"{oggetto or ''} {body or ''} {' '.join(allegati or [])}"
     parsed = parse(full)
     rag = parsed.get("ragione_sociale", "").strip()
     if rag and len(rag) >= 3:
-        return rag[:120]
+        return clean_company_name(rag[:120])
 
-    subject = (oggetto or "").strip()
-    subject = re.sub(r"(?i)\b(richiesta|documenti|visura|bilancio|centrale rischi|report|allegati|pratica|finanziamento|fwd|fw|re)\b", " ", subject)
-    subject = re.sub(r"[\[\]\(\):;,_\-]+", " ", subject)
-    subject = re.sub(r"\s+", " ", subject).strip()
-    if len(subject) >= 6 and len(subject.split()) <= 5:
-        return subject[:120]
+    piva = parsed.get("piva", "").strip()
+    if piva:
+        return f"PIVA_{piva}"
 
-    mittente_mail = (mittente_mail or "").lower()
-    domain = mittente_mail.split("@")[-1] if "@" in mittente_mail else ""
-    generic = ["gmail.com","outlook.com","hotmail.com","yahoo.com","libero.it","icloud.com","proton.me","protonmail.com","aruba.it","pec.it","tiscali.it","virgilio.it"]
-    if domain and domain not in generic:
-        name = domain.split(".")[0].replace("-", " ").replace("_", " ").upper()
-        return f"{name} - cliente da mail"
+    cf = parsed.get("cf", "").strip()
+    if cf and len(cf) >= 8:
+        return f"CF_{cf}"
 
-    return f"Cliente automatico - {mittente_mail or 'mittente sconosciuto'}"
+    # Ultimo tentativo: nome file/oggetto con forma giuridica esplicita.
+    m = re.search(r"([A-Z0-9&'’\.\- ]{3,80}\s+(?:S\.?R\.?L\.?|SRL|S\.?P\.?A\.?|SPA|S\.?A\.?S\.?|SAS|S\.?N\.?C\.?|SNC|COOP|CONSORZIO|FONDAZIONE|ASSOCIAZIONE))", full, re.I)
+    if m:
+        return clean_company_name(m.group(1)[:120])
+
+    return ""
 
 def ensure_company_from_mail(mittente_mail, oggetto, body, allegati=None):
     full_text = f"{mittente_mail or ''} {oggetto or ''} {body or ''} {' '.join(allegati or [])}"
@@ -876,10 +889,17 @@ def ensure_company_from_mail(mittente_mail, oggetto, body, allegati=None):
         return rows.iloc[0]["ragione_sociale"], False
 
     rag = company_candidate_from_mail(mittente_mail, oggetto, body, allegati)
+    if not rag:
+        return "DA_VERIFICARE", False
+
     parsed = parse(full_text)
+    rows = q("SELECT id FROM aziende WHERE ragione_sociale=?", (rag,))
+    if len(rows):
+        return rag, False
+
     x("""INSERT INTO aziende(ragione_sociale,piva,cf,rea,pec,sede,comune,provincia,amministratore,capitale_sociale,ateco,data_costituzione,stato_attivita,collaboratore,fonte,testo_estratto,created_at)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-      (rag, parsed.get("piva",""), parsed.get("cf",""), parsed.get("rea",""), mittente_mail or parsed.get("pec",""),
+      (rag, parsed.get("piva",""), parsed.get("cf",""), parsed.get("rea",""), parsed.get("pec","") or "",
        parsed.get("sede",""), parsed.get("comune",""), parsed.get("provincia",""), parsed.get("amministratore",""),
        parsed.get("capitale_sociale",""), parsed.get("ateco",""), parsed.get("data_costituzione",""),
        parsed.get("stato_attivita",""), "", "MAIL AUTO", full_text[:50000], datetime.now().isoformat()))
@@ -920,60 +940,165 @@ def send_documents_smtp(smtp_host, smtp_port, use_ssl, username, password, to_em
     log("DOCS", "invio documenti via mail", f"{attached} allegati inviati a {to_email}")
     return attached
 
-def download_mail_imap(host, port, use_ssl, account_email, password, mailbox, sender_filter, start_date, end_date, auto_create_client=True):
+def fetch_mail_header(M, num):
+    """Fetch leggero: scarica solo intestazioni, non allegati. Serve per evitare refetch e quota IMAP."""
+    try:
+        status, msg_data = M.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])")
+        if status != "OK" or not msg_data:
+            return None
+        raw = b"".join(part[1] for part in msg_data if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)))
+        if not raw:
+            return None
+        return BytesParser(policy=policy.default).parsebytes(raw)
+    except Exception:
+        return None
+
+def stable_message_key(msg):
+    mid = str(msg.get("Message-ID", "") or "").strip()
+    if mid:
+        return mid[:250]
+    basis = f"{msg.get('From','')}|{msg.get('To','')}|{msg.get('Subject','')}|{msg.get('Date','')}"
+    return "NOID_" + hashlib.md5(basis.encode("utf-8", errors="ignore")).hexdigest()
+
+def mail_message_already_saved(message_key):
+    if not message_key:
+        return False
+    try:
+        d = q("SELECT id FROM mail_messages WHERE message_id=? LIMIT 1", (message_key,))
+        return len(d) > 0
+    except Exception:
+        return False
+
+def document_hash_exists(h):
+    if not h:
+        return False
+    try:
+        d = q("SELECT id FROM documenti WHERE hash_md5=? LIMIT 1", (h,))
+        return len(d) > 0
+    except Exception:
+        return False
+
+def sort_imap_ids_newest_first(ids):
+    try:
+        return sorted(ids, key=lambda x: int(x), reverse=True)
+    except Exception:
+        return list(reversed(ids))
+
+def download_mail_imap(host, port, use_ssl, account_email, password, mailbox, sender_filter, start_date, end_date, auto_create_client=True, max_messages=20):
     base_folder = MAILDIR / folder_period(start_date, end_date)
     base_folder.mkdir(parents=True, exist_ok=True)
     if use_ssl:
         M = imaplib.IMAP4_SSL(host, int(port))
     else:
         M = imaplib.IMAP4(host, int(port))
-    M.login(account_email, password)
-    M.select(mailbox or "INBOX")
+    try:
+        M.login(account_email, password)
+        M.select(mailbox or "INBOX")
 
-    # Ricerca filtrata: il sistema non scarica mai messaggi fuori whitelist.
-    ids = imap_search_ids(M, start_date, end_date, sender_filter)
+        # Ricerca filtrata: il sistema non scarica mai messaggi fuori whitelist.
+        ids = imap_search_ids(M, start_date, end_date, sender_filter)
+        ids = sort_imap_ids_newest_first(ids)
+        if max_messages and int(max_messages) > 0:
+            ids = ids[:int(max_messages)]
 
-    x("INSERT INTO mail_downloads(account_email,sender_filter,date_from,date_to,folder_path,messages_count,attachments_count,created_at) VALUES(?,?,?,?,?,?,?,?)",
-      (account_email, sender_filter or "MITTENTI_AUTORIZZATI", str(start_date), str(end_date), str(base_folder), 0, 0, datetime.now().isoformat()))
-    download_id = q("SELECT MAX(id) id FROM mail_downloads").iloc[0]["id"]
+        msg_count = 0
+        att_count = 0
+        auto_clients = 0
+        skipped_saved = 0
+        skipped_no_attachment = 0
+        skipped_duplicate_attachments = 0
 
-    msg_count = 0
-    att_count = 0
-    auto_clients = 0
+        x("INSERT INTO mail_downloads(account_email,sender_filter,date_from,date_to,folder_path,messages_count,attachments_count,created_at) VALUES(?,?,?,?,?,?,?,?)",
+          (account_email, sender_filter or "MITTENTI_AUTORIZZATI", str(start_date), str(end_date), str(base_folder), 0, 0, datetime.now().isoformat()))
+        download_id = q("SELECT MAX(id) id FROM mail_downloads").iloc[0]["id"]
 
-    for num in ids:
-        status, msg_data = M.fetch(num, "(RFC822)")
-        if status != "OK" or not msg_data:
-            continue
-        raw = msg_data[0][1]
-        msg = BytesParser(policy=policy.default).parsebytes(raw)
+        for num in ids:
+            # Prima scarica solo header: consuma pochissima banda e non tocca allegati.
+            hmsg = fetch_mail_header(M, num)
+            if hmsg is not None:
+                hmitt_nome, hmitt_mail = parseaddr(str(hmsg.get("From", "")))
+                if not is_allowed_mail_sender(hmitt_mail or hmitt_nome):
+                    continue
+                message_key = stable_message_key(hmsg)
+                if mail_message_already_saved(message_key):
+                    skipped_saved += 1
+                    continue
+            else:
+                message_key = ""
 
-        mittente_nome, mittente_mail = parseaddr(str(msg.get("From","")))
-        if not is_allowed_mail_sender(mittente_mail or mittente_nome):
-            continue
-        destinatario = str(msg.get("To","") or "")
-        oggetto = decode_mime(msg.get("Subject",""))
-        body = get_body(msg)
-        try:
-            dt = parsedate_to_datetime(msg.get("Date"))
-            dmail = dt.date().isoformat()
-            omail = dt.strftime("%H:%M")
-        except Exception:
-            dmail = ""
-            omail = ""
-
-        sender_folder_name = safe(mittente_mail or mittente_nome or "mittente_sconosciuto")
-        sender_folder = base_folder / sender_folder_name
-        sender_folder.mkdir(parents=True, exist_ok=True)
-
-        allegati = []
-        allegati_paths = []
-        for part in msg.iter_attachments():
-            fname = decode_mime(part.get_filename() or "allegato")
-            fname = safe(fname)
             try:
-                payload = part.get_payload(decode=True)
-                if payload:
+                status, msg_data = M.fetch(num, "(BODY.PEEK[])")
+            except imaplib.IMAP4.abort as e:
+                raise RuntimeError("Quota IMAP superata dal provider: il server ha bloccato temporaneamente il download per limite comandi/banda. Riprova più tardi e usa un limite basso, ad esempio 10-20 mail per volta.") from e
+
+            if status != "OK" or not msg_data:
+                continue
+            raw = b"".join(part[1] for part in msg_data if isinstance(part, tuple) and isinstance(part[1], (bytes, bytearray)))
+            if not raw:
+                continue
+            msg = BytesParser(policy=policy.default).parsebytes(raw)
+
+            if not message_key:
+                message_key = stable_message_key(msg)
+            if mail_message_already_saved(message_key):
+                skipped_saved += 1
+                continue
+
+            mittente_nome, mittente_mail = parseaddr(str(msg.get("From", "")))
+            if not is_allowed_mail_sender(mittente_mail or mittente_nome):
+                continue
+            destinatario = str(msg.get("To", "") or "")
+            oggetto = decode_mime(msg.get("Subject", ""))
+            body = get_body(msg)
+            try:
+                dt = parsedate_to_datetime(msg.get("Date"))
+                dmail = dt.date().isoformat()
+                omail = dt.strftime("%H:%M")
+            except Exception:
+                dmail = ""
+                omail = ""
+
+            allegati = []
+            allegati_paths = []
+            payloads_to_save = []
+            for part in msg.iter_attachments():
+                fname = decode_mime(part.get_filename() or "allegato")
+                fname = safe(fname)
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        h = file_hash_bytes(payload)
+                        if h and document_hash_exists(h):
+                            skipped_duplicate_attachments += 1
+                            allegati.append(fname + " [DUPLICATO NON SALVATO]")
+                            continue
+                        allegati.append(fname)
+                        payloads_to_save.append((fname, payload, h))
+                except Exception:
+                    pass
+
+            if not payloads_to_save and not allegati:
+                skipped_no_attachment += 1
+                continue
+
+            full_text = f"{mittente_mail} {destinatario} {oggetto} {body} {' '.join(allegati)}"
+            coll = detect_collaboratore(full_text)
+            az = detect_azienda(full_text)
+
+            if auto_create_client and not az:
+                az, created = ensure_company_from_mail(mittente_mail or mittente_nome, oggetto, body, allegati)
+                if created:
+                    auto_clients += 1
+
+            if not az or az == "DA_VERIFICARE":
+                az = "DA_VERIFICARE"
+                sender_folder = base_folder / "Temporanea_Da_Abbinare" / safe(mittente_mail or mittente_nome or "mittente_sconosciuto")
+            else:
+                sender_folder = base_folder / safe(az) / safe(mittente_mail or mittente_nome or "mittente_sconosciuto")
+            sender_folder.mkdir(parents=True, exist_ok=True)
+
+            for fname, payload, h in payloads_to_save:
+                try:
                     out = sender_folder / fname
                     if out.exists():
                         stem, suffix = out.stem, out.suffix
@@ -982,34 +1107,31 @@ def download_mail_imap(host, port, use_ssl, account_email, password, mailbox, se
                             k += 1
                         out = sender_folder / f"{stem}_{k}{suffix}"
                     out.write_bytes(payload)
-                    allegati.append(out.name)
-                    allegati_paths.append(str(out))
+                    allegati_paths.append((str(out), out.name, h))
                     att_count += 1
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        full_text = f"{mittente_mail} {destinatario} {oggetto} {body} {' '.join(allegati)}"
-        coll = detect_collaboratore(full_text)
-        az = detect_azienda(full_text)
+            for apath, aname, h in allegati_paths:
+                x("INSERT INTO documenti(azienda,categoria,filename,path,descrizione,testo_estratto,created_at,hash_md5) VALUES(?,?,?,?,?,?,?,?)",
+                  (az, "MAIL", aname, apath, f"Allegato mail da {mittente_mail or mittente_nome} - {oggetto}", body[:10000], datetime.now().isoformat(), h))
 
-        if auto_create_client and not az:
-            az, created = ensure_company_from_mail(mittente_mail or mittente_nome, oggetto, body, allegati)
-            if created:
-                auto_clients += 1
+            x("INSERT INTO mail_messages(download_id,account_email,mittente,destinatario,data,ora,oggetto,contenuto,allegati,folder_path,collaboratore,azienda,created_at,message_id,imap_num) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (int(download_id), account_email, mittente_mail or mittente_nome, destinatario, dmail, omail, oggetto, body[:10000], ", ".join(allegati), str(sender_folder), coll, az, datetime.now().isoformat(), message_key, str(num.decode() if isinstance(num, bytes) else num)))
+            msg_count += 1
 
-        for apath, aname in zip(allegati_paths, allegati):
-            x("INSERT INTO documenti(azienda,categoria,filename,path,descrizione,testo_estratto,created_at) VALUES(?,?,?,?,?,?,?)",
-              (az, "MAIL", aname, apath, f"Allegato mail da {mittente_mail or mittente_nome} - {oggetto}", body[:10000], datetime.now().isoformat()))
-
-        x("INSERT INTO mail_messages(download_id,account_email,mittente,destinatario,data,ora,oggetto,contenuto,allegati,folder_path,collaboratore,azienda,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          (int(download_id), account_email, mittente_mail or mittente_nome, destinatario, dmail, omail, oggetto, body[:10000], ", ".join(allegati), str(sender_folder), coll, az, datetime.now().isoformat()))
-        msg_count += 1
-
-    x("UPDATE mail_downloads SET messages_count=?, attachments_count=? WHERE id=?", (msg_count, att_count, int(download_id)))
-    M.close()
-    M.logout()
-    log("MAIL", "scarico completato", f"{msg_count} mail, {att_count} allegati, {auto_clients} clienti creati")
-    return msg_count, att_count, str(base_folder), auto_clients
+        x("UPDATE mail_downloads SET messages_count=?, attachments_count=? WHERE id=?", (msg_count, att_count, int(download_id)))
+        log("MAIL", "scarico completato", f"{msg_count} mail, {att_count} allegati, {auto_clients} clienti creati, {skipped_saved} già salvate, {skipped_duplicate_attachments} allegati duplicati")
+        return msg_count, att_count, str(base_folder), auto_clients, skipped_saved, skipped_duplicate_attachments
+    finally:
+        try:
+            M.close()
+        except Exception:
+            pass
+        try:
+            M.logout()
+        except Exception:
+            pass
 
 def page_mail():
     hero("📥 Scarica Mail", "Scarico email e allegati solo dagli 8 mittenti autorizzati, creazione automatica cliente e report PDF.")
@@ -1026,13 +1148,14 @@ def page_mail():
         mailbox = st.text_input("Cartella IMAP", value="INBOX")
         sender_filter = st.text_input("Mittente specifico autorizzato", placeholder="opzionale: lascia vuoto per scaricare tutti gli 8 mittenti autorizzati")
         auto_create = st.checkbox("Se non trova il cliente in anagrafica, crealo automaticamente", value=True)
+        max_messages = st.number_input("Massimo mail da scaricare per ogni click", min_value=5, max_value=200, value=20, step=5, help="Usa 10-20 se il provider segnala OVERQUOTA. Aumenta solo dopo il primo scarico.")
 
         suggested = next_mail_start(account_email, sender_filter or "MITTENTI_AUTORIZZATI") if account_email else date(2026,1,1)
         c3,c4 = st.columns(2)
         start = c3.date_input("Data inizio scarico", value=suggested)
         end = c4.date_input("Data fine scarico", value=date.today())
 
-        st.info("Filtro attivo: verranno scaricate solo le email provenienti dagli 8 mittenti autorizzati. Tutte le altre email vengono ignorate.")
+        st.info("Filtro attivo: verranno scaricate solo le email provenienti dagli 8 mittenti autorizzati. Modalità IMAP SAFE: prima legge solo le intestazioni, salta le mail già salvate e scarica al massimo il numero scelto per evitare OVERQUOTA.")
         st.code("\n".join(ALLOWED_MAIL_SENDERS), language="text")
         st.caption("Le cartelle vengono create in: mail / data_inizio_data_fine / mittente. Gli allegati entrano anche in Docs.")
 
@@ -1053,11 +1176,13 @@ def page_mail():
             else:
                 with st.spinner("Scarico mail e allegati in corso..."):
                     try:
-                        n, a, folder, auto_clients = download_mail_imap(host, port, use_ssl, account_email, password, mailbox, sender_filter, start, end, auto_create)
-                        st.success(f"Scarico completato: {n} mail, {a} allegati, {auto_clients} clienti creati automaticamente.")
+                        n, a, folder, auto_clients, skipped_saved, skipped_dup = download_mail_imap(host, port, use_ssl, account_email, password, mailbox, sender_filter, start, end, auto_create, max_messages)
+                        st.success(f"Scarico completato: {n} mail, {a} allegati, {auto_clients} clienti creati automaticamente. Già salvate saltate: {skipped_saved}. Allegati duplicati saltati: {skipped_dup}.")
                         st.code(folder)
                     except Exception as e:
                         st.error("Errore durante lo scarico mail.")
+                        if "Quota IMAP" in str(e) or "OVERQUOTA" in str(e).upper():
+                            st.warning("Il provider ha bloccato temporaneamente il download per limite comandi/banda. Attendi il reset del provider e riprova con massimo 10-20 mail per click e intervallo date più stretto.")
                         st.exception(e)
 
         st.divider()
