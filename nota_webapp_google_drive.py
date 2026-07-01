@@ -16,7 +16,21 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 
-APP_VERSION="TOP v6.5 FIX AMMINISTRATORE"
+APP_VERSION="TOP v6.6 MITTENTI AUTORIZZATI"
+
+# Filtro rigido mittenti autorizzati per il modulo Scarica Mail.
+# Il download IMAP salva esclusivamente email e allegati provenienti da questi indirizzi.
+ALLOWED_MAIL_SENDERS = [
+    "elibetty731@gmail.com",
+    "valentinaboratto82@gmail.com",
+    "stefano.faraone@eurofintechsrl.it",
+    "pratichebs@proton.me",
+    "sergio.pedolazzi@katudi.it",
+    "paolo.baldinelli@katudi.it",
+    "pratiche@katudi.it",
+    "niccolo.sovico@ener2crowd.com",
+]
+ALLOWED_MAIL_SENDERS_SET = {x.lower().strip() for x in ALLOWED_MAIL_SENDERS}
 DATA=Path("data"); UPLOADS=Path("uploads"); EXPORTS=Path("exports"); STATIC=Path("static"); MANUALS=Path("manuals"); MAILDIR=Path("mail")
 for p in [DATA,UPLOADS,EXPORTS,STATIC,MANUALS,MAILDIR]: p.mkdir(parents=True,exist_ok=True)
 DB=DATA/"financeplus_360_v6_1.db"
@@ -731,6 +745,44 @@ def imap_date(d):
 def folder_period(start, end):
     return f"{start.strftime('%d-%m-%Y')}_{end.strftime('%d-%m-%Y')}"
 
+def normalize_email_address(value):
+    """Restituisce l'indirizzo email normalizzato da header o stringa libera."""
+    try:
+        _, addr = parseaddr(str(value or ""))
+    except Exception:
+        addr = str(value or "")
+    return addr.lower().strip()
+
+def is_allowed_mail_sender(value):
+    return normalize_email_address(value) in ALLOWED_MAIL_SENDERS_SET
+
+def imap_search_ids(M, start_date, end_date, sender_filter=""):
+    """Cerca su IMAP solo i messaggi dei mittenti autorizzati.
+    Se sender_filter e' valorizzato, viene usato solo se appartiene alla whitelist.
+    """
+    before_date = end_date + pd.Timedelta(days=1)
+    if hasattr(before_date, "date"):
+        before_date = before_date.date()
+
+    requested = normalize_email_address(sender_filter)
+    senders = [requested] if requested else list(ALLOWED_MAIL_SENDERS)
+    senders = [s for s in senders if s in ALLOWED_MAIL_SENDERS_SET]
+    if not senders:
+        return []
+
+    found = []
+    seen = set()
+    for sender in senders:
+        criteria = f'(SINCE {imap_date(start_date)} BEFORE {imap_date(before_date)} FROM "{sender}")'
+        status, data = M.search(None, criteria)
+        if status == "OK" and data and data[0]:
+            for msg_id in data[0].split():
+                if msg_id not in seen:
+                    seen.add(msg_id)
+                    found.append(msg_id)
+    return found
+
+
 def next_mail_start(account_email="", sender_filter=""):
     try:
         d = q("SELECT MAX(date_to) ultimo FROM mail_downloads WHERE account_email=? AND sender_filter=?", (account_email, sender_filter))
@@ -878,22 +930,11 @@ def download_mail_imap(host, port, use_ssl, account_email, password, mailbox, se
     M.login(account_email, password)
     M.select(mailbox or "INBOX")
 
-    before_date = end_date + pd.Timedelta(days=1)
-    if hasattr(before_date, "date"):
-        before_date = before_date.date()
-
-    criteria = f'(SINCE {imap_date(start_date)} BEFORE {imap_date(before_date)}'
-    if sender_filter:
-        criteria += f' FROM "{sender_filter}"'
-    criteria += ')'
-
-    status, data = M.search(None, criteria)
-    if status != "OK":
-        status, data = M.search(None, f'(SINCE {imap_date(start_date)} BEFORE {imap_date(before_date)})')
-    ids = data[0].split() if data and data[0] else []
+    # Ricerca filtrata: il sistema non scarica mai messaggi fuori whitelist.
+    ids = imap_search_ids(M, start_date, end_date, sender_filter)
 
     x("INSERT INTO mail_downloads(account_email,sender_filter,date_from,date_to,folder_path,messages_count,attachments_count,created_at) VALUES(?,?,?,?,?,?,?,?)",
-      (account_email, sender_filter, str(start_date), str(end_date), str(base_folder), 0, 0, datetime.now().isoformat()))
+      (account_email, sender_filter or "MITTENTI_AUTORIZZATI", str(start_date), str(end_date), str(base_folder), 0, 0, datetime.now().isoformat()))
     download_id = q("SELECT MAX(id) id FROM mail_downloads").iloc[0]["id"]
 
     msg_count = 0
@@ -908,6 +949,8 @@ def download_mail_imap(host, port, use_ssl, account_email, password, mailbox, se
         msg = BytesParser(policy=policy.default).parsebytes(raw)
 
         mittente_nome, mittente_mail = parseaddr(str(msg.get("From","")))
+        if not is_allowed_mail_sender(mittente_mail or mittente_nome):
+            continue
         destinatario = str(msg.get("To","") or "")
         oggetto = decode_mime(msg.get("Subject",""))
         body = get_body(msg)
@@ -969,7 +1012,7 @@ def download_mail_imap(host, port, use_ssl, account_email, password, mailbox, se
     return msg_count, att_count, str(base_folder), auto_clients
 
 def page_mail():
-    hero("📥 Scarica Mail", "Scarico email e allegati, creazione automatica cliente e report PDF.")
+    hero("📥 Scarica Mail", "Scarico email e allegati solo dagli 8 mittenti autorizzati, creazione automatica cliente e report PDF.")
     t1,t2,t3,t4 = st.tabs(["Scarica Mail", "R/Mail", "R/Collaboratori", "R/Aziende"])
 
     with t1:
@@ -981,14 +1024,16 @@ def page_mail():
         account_email = c1.text_input("Email account da cui scaricare")
         password = c2.text_input("Password / App Password", type="password")
         mailbox = st.text_input("Cartella IMAP", value="INBOX")
-        sender_filter = st.text_input("Scarica solo mail ricevute da questo mittente", placeholder="lascia vuoto per tutte")
+        sender_filter = st.text_input("Mittente specifico autorizzato", placeholder="opzionale: lascia vuoto per scaricare tutti gli 8 mittenti autorizzati")
         auto_create = st.checkbox("Se non trova il cliente in anagrafica, crealo automaticamente", value=True)
 
-        suggested = next_mail_start(account_email, sender_filter) if account_email else date(2026,1,1)
+        suggested = next_mail_start(account_email, sender_filter or "MITTENTI_AUTORIZZATI") if account_email else date(2026,1,1)
         c3,c4 = st.columns(2)
         start = c3.date_input("Data inizio scarico", value=suggested)
         end = c4.date_input("Data fine scarico", value=date.today())
 
+        st.info("Filtro attivo: verranno scaricate solo le email provenienti dagli 8 mittenti autorizzati. Tutte le altre email vengono ignorate.")
+        st.code("\n".join(ALLOWED_MAIL_SENDERS), language="text")
         st.caption("Le cartelle vengono create in: mail / data_inizio_data_fine / mittente. Gli allegati entrano anche in Docs.")
 
         cbtn1,cbtn2 = st.columns(2)
@@ -996,7 +1041,7 @@ def page_mail():
         scarica_tutte = cbtn2.button("Scarica tutte le mail nuove", use_container_width=True)
 
         if scarica_tutte and account_email:
-            start = next_mail_start(account_email, "")
+            start = next_mail_start(account_email, "MITTENTI_AUTORIZZATI")
             sender_filter = ""
             end = date.today()
 

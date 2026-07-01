@@ -1,4 +1,4 @@
-# FinancePlus 360 TOP v6.5 FIX AMMINISTRATORE
+# FinancePlus 360 TOP v6.6 MITTENTI AUTORIZZATI
 
 Correzione specifica:
 - il campo amministratore non deve più valorizzarsi con testi errati come "Data di"
@@ -11,3 +11,21 @@ Correzione specifica:
 3. vai in Impostazioni > Correzione dati
 4. clicca Correggi automaticamente anagrafiche esistenti
 5. se il testo estratto non contiene davvero il nome, usa la modifica manuale in Scheda Azienda > Anagrafica oppure reimporta la visura
+
+
+## Modifica V6.6 - Scarico mail filtrato per mittenti autorizzati
+
+Il modulo **Scarica Mail** ora scarica esclusivamente email e allegati provenienti dai seguenti indirizzi:
+
+- elibetty731@gmail.com
+- Valentinaboratto82@gmail.com
+- stefano.faraone@eurofintechsrl.it
+- praticheBS@proton.me
+- sergio.pedolazzi@katudi.it
+- paolo.baldinelli@katudi.it
+- pratiche@katudi.it
+- niccolo.sovico@ener2crowd.com
+
+Tutte le altre email vengono ignorate automaticamente, anche se contengono allegati.
+
+La creazione automatica del cliente in anagrafica resta attiva: quando il sistema riconosce un'azienda da oggetto, corpo email, allegati, P.IVA, codice fiscale o PEC, crea/aggiorna l'anagrafica e abbina i documenti. I documenti non abbinabili restano in gestione come cliente automatico/da verificare.
